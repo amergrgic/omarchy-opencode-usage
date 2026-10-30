@@ -125,6 +125,15 @@ Everything below is what the plugin actually does; nothing else runs.
 The key is only ever sent to `https://opencode.ai/zen/go/v1/usage` as a Bearer
 token; it is never written to a record, cache, or log.
 
+## Credits
+
+The bar mark reproduces the geometry of the OpenCode logo (taken from
+[opencode.ai/favicon.svg](https://opencode.ai/favicon.svg)) and is drawn in QML
+rather than shipped as an asset, so it follows the bar's foreground colour on
+any theme. OpenCode and its logo belong to their respective owners: this is an
+unofficial companion widget, not affiliated with, endorsed by, or supported by
+OpenCode.
+
 ## Tests
 
 ```sh

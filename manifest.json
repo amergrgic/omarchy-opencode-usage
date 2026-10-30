@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.amergrgic.opencode-usage",
   "name": "OpenCode Tokens, All Clients",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "amergrgic",
   "license": "MIT",
   "description": "OpenCode Go allowance meters plus token usage per model across omp, opencode, and Hermes sessions.",

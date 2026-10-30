@@ -230,6 +230,10 @@ Panel {
     return Qt.hsla(hue, saturation, lightness, 1)
   }
 
+  function alpha(color, value) {
+    return Qt.rgba(color.r, color.g, color.b, value)
+  }
+
   function shareLabel(share) {
     var percent = Number(share || 0) * 100
     if (percent <= 0) return "0%"
@@ -305,7 +309,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󱚣"
+    iconComponent: markComponent
     active: root.errorText !== ""
     tooltipText: root.barTooltip()
     onPressed: function(buttonCode) {
@@ -515,6 +519,11 @@ Panel {
         }
       }
     }
+  }
+
+  Component {
+    id: markComponent
+    OpenCodeMark {}
   }
 
   // Section title that doubles as a collapse control: chevron, label, and a
@@ -769,6 +778,34 @@ Panel {
     PanelToolTip {
       visible: hover.containsMouse && shareRow.tooltip !== ""
       text: shareRow.tooltip
+    }
+  }
+
+  // The OpenCode mark, drawn rather than shipped: geometry traced from
+  // opencode.ai/favicon.svg (outer square with a filled block in its inner
+  // bottom-left), colours bound to the bar so it follows the theme instead of
+  // needing a light and a dark asset. Not an official OpenCode asset.
+  component OpenCodeMark: Item {
+    id: mark
+
+    readonly property real side: Math.min(width, height) * 0.92
+    readonly property real frame: side * 0.125
+
+    Rectangle {
+      width: mark.side
+      height: mark.side
+      anchors.centerIn: parent
+      color: "transparent"
+      border.width: mark.frame
+      border.color: root.foreground
+    }
+
+    Rectangle {
+      width: mark.side * 0.5
+      height: mark.side * 0.5
+      x: (parent.width - mark.side) / 2 + mark.side * 0.25
+      y: (parent.height - mark.side) / 2 + mark.side * 0.375
+      color: root.alpha(root.foreground, 0.45)
     }
   }
 }
