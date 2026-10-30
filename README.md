@@ -1,5 +1,7 @@
 # OpenCode Go Usage (Omarchy bar widget)
 
+![OpenCode Go usage panel](preview.png)
+
 One bar icon: the **OpenCode Go** allowance windows, today's tokens, and
 per-model totals — counted from **every** client on this machine, not just
 one.
