@@ -127,10 +127,11 @@ token; it is never written to a record, cache, or log.
 
 ## Credits
 
-The bar mark reproduces the geometry of the OpenCode logo (taken from
-[opencode.ai/favicon.svg](https://opencode.ai/favicon.svg)) and is drawn in QML
-rather than shipped as an asset, so it follows the bar's foreground colour on
-any theme. OpenCode and its logo belong to their respective owners: this is an
+The bar mark reproduces the geometry of the OpenCode logo, traced from the
+90×112 mark inside [opencode.ai/apple-touch-icon-v3.png](https://opencode.ai/apple-touch-icon-v3.png)
+(a portrait frame with its lower two thirds filled), and is drawn in QML rather
+than shipped as an asset, so it follows the bar's foreground colour on any
+theme. OpenCode and its logo belong to their respective owners: this is an
 unofficial companion widget, not affiliated with, endorsed by, or supported by
 OpenCode.
 

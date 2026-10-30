@@ -781,19 +781,21 @@ Panel {
     }
   }
 
-  // The OpenCode mark, drawn rather than shipped: geometry traced from
-  // opencode.ai/favicon.svg (outer square with a filled block in its inner
-  // bottom-left), colours bound to the bar so it follows the theme instead of
-  // needing a light and a dark asset. Not an official OpenCode asset.
+  // The OpenCode mark, drawn rather than shipped: a portrait frame with the
+  // interior's lower two thirds filled, traced from the 180 px v3 icon
+  // (opencode.ai/apple-touch-icon-v3.png) whose mark measures 90x112 with a
+  // 22 px frame. Colours follow the bar foreground, so no light/dark asset
+  // pair is needed. Not an official OpenCode asset.
   component OpenCodeMark: Item {
     id: mark
 
-    readonly property real side: Math.min(width, height) * 0.92
-    readonly property real frame: side * 0.125
+    readonly property real height_: Math.min(width, height) * 0.94
+    readonly property real width_: height_ * 90 / 112
+    readonly property real frame: width_ * 22 / 90
 
     Rectangle {
-      width: mark.side
-      height: mark.side
+      width: mark.width_
+      height: mark.height_
       anchors.centerIn: parent
       color: "transparent"
       border.width: mark.frame
@@ -801,10 +803,10 @@ Panel {
     }
 
     Rectangle {
-      width: mark.side * 0.5
-      height: mark.side * 0.5
-      x: (parent.width - mark.side) / 2 + mark.side * 0.25
-      y: (parent.height - mark.side) / 2 + mark.side * 0.375
+      width: mark.width_ - mark.frame * 2
+      height: (mark.height_ - mark.frame * 2) * 45 / 68
+      x: (parent.width - mark.width_) / 2 + mark.frame
+      y: (parent.height - mark.height_) / 2 + mark.height_ - mark.frame - height
       color: root.alpha(root.foreground, 0.45)
     }
   }
