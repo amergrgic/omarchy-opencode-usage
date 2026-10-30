@@ -114,7 +114,7 @@ Everything below is what the plugin actually does; nothing else runs.
 - **Subprocess:** runs its own `helpers/collector` through
   `/usr/bin/timeout 20` with an argv array — no shell, nothing from the network
   is ever executed.
-- **Privileges:** no root, no `sudo`, no systemd units, no downloads, no telemetry.
+- **Privileges:** runs entirely as your user — no elevated commands, no systemd units, no downloads, no telemetry.
 
 ## Key resolution
 
