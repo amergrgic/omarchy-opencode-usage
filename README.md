@@ -81,7 +81,40 @@ omarchy plugin add <this-repo-url> --enable
 omarchy bar move io.github.amergrgic.opencode-usage --section right
 ```
 
-The collector is stdlib-only Python 3.
+The collector is stdlib-only Python 3 — no packages, no `jq`, no daemon.
+
+## Removal
+
+```sh
+omarchy plugin remove io.github.amergrgic.opencode-usage
+```
+
+That deletes the plugin directory and its `shell.json` layout entry. The only
+file the widget ever created outside its own directory is a small limit probe
+cache, which can go too:
+
+```sh
+rm -rf ~/.cache/omarchy/opencode-usage
+```
+
+## Security
+
+Everything below is what the plugin actually does; nothing else runs.
+
+- **Reads, read-only:** `~/.omp/agent/sessions/**/*.jsonl` and
+  `~/.pi/agent/sessions/**/*.jsonl`, `~/.local/share/opencode*/**.db`
+  (SQLite opened with `mode=ro` + `query_only`), `$HERMES_HOME/state.db` or
+  `~/.hermes/state.db` (+ `profiles/*/state.db`), `~/.local/share/opencode/auth.json`.
+- **Writes:** exactly one file, `~/.cache/omarchy/opencode-usage/limits.json`
+  (mode `0600`, cached 5 minutes). No configuration is touched, ever.
+- **Network:** one HTTPS request per probe to
+  `https://opencode.ai/zen/go/v1/usage`, 8-second deadline, 64 KB body cap.
+  The bearer key is read from the environment, `auth.json`, or the opencode
+  v2 `credential` table, and is never written to the record, the cache, or a log.
+- **Subprocess:** runs its own `helpers/collector` through
+  `/usr/bin/timeout 20` with an argv array — no shell, nothing from the network
+  is ever executed.
+- **Privileges:** no root, no `sudo`, no systemd units, no downloads, no telemetry.
 
 ## Key resolution
 
@@ -98,5 +131,6 @@ token; it is never written to a record, cache, or log.
 python3 -m unittest discover -s tests -v
 ```
 
-The tests build synthetic stores for every source and assert the per-model and
-per-day aggregation, the provider filter, and row de-duplication.
+The tests build synthetic stores for every source and assert the per-client and
+per-model aggregation, the provider filter, message de-duplication, and that
+older rows stay out of the "today" total.
