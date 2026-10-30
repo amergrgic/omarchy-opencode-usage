@@ -1,0 +1,514 @@
+#!/usr/bin/python3
+# omarchy:summary=Print OpenCode usage (limits + local tokens) as JSON
+# omarchy:args=[--force]
+# omarchy:hidden=true
+"""Collect OpenCode usage into one display-ready JSON record.
+
+Two independent halves:
+
+* Limits come from the OpenCode Go usage endpoint, authenticated by the key the
+  CLI already stored (``~/.local/share/opencode/auth.json`` or, on opencode v2,
+  the ``credential`` table in ``opencode.db``).
+* Token stats come from every client on this machine that records them:
+  omp/pi JSONL transcripts, the opencode v2 ``session_message`` projection, the
+  legacy opencode v1 ``message`` table (opencode-crew and friends), and Hermes'
+  ``state.db``. Only ``opencode*`` providers are counted, so a Claude or Codex
+  session that happens to run through the same client stays out.
+
+There is no intermediate cache for the token scan: it reads local files, costs
+well under a second, and a stale cache is exactly what makes a usage widget
+quietly stop updating. Only the network probe is cached.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import http.client
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Optional
+
+SCHEMA_VERSION = 1
+PROVIDER_PREFIX = "opencode"
+USAGE_ENDPOINT = "https://opencode.ai/zen/go/v1/usage"
+USER_AGENT = "omarchy-opencode-usage/1.0"
+TIMEOUT_SECONDS = 8
+MAX_BODY_BYTES = 65536
+MAX_KEY_LEN = 512
+MAX_ROWS = 200_000
+LIMIT_CACHE_SECONDS = 300
+WINDOWS = (("rolling", "Session", "5-hour"), ("weekly", "Weekly", "7-day"),
+           ("monthly", "Monthly", "30-day"))
+
+
+# ------------------------------------------------------------------ plumbing
+
+def xdg_data_home() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+
+
+def cache_dir() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "opencode-usage"
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def read_json(path: Path) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def now_ms() -> int:
+    return round(time.time() * 1000)
+
+
+def int_or_zero(value: Any) -> int:
+    if type(value) is int:
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return 0
+
+
+def day_from(value: Any) -> str:
+    """Local date for an epoch-ms/epoch-s/ISO timestamp; today when unusable."""
+    if isinstance(value, str) and value:
+        text = value.strip().replace("Z", "+00:00")
+        try:
+            parsed = dt.datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.astimezone().strftime("%Y-%m-%d")
+        except ValueError:
+            return dt.datetime.now().strftime("%Y-%m-%d")
+    if isinstance(value, (int, float)) and value > 0:
+        seconds = value / 1000.0 if value > 1e11 else float(value)
+        try:
+            return dt.datetime.fromtimestamp(seconds).strftime("%Y-%m-%d")
+        except (OSError, OverflowError, ValueError):
+            pass
+    return dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def token_bucket() -> dict:
+    return {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+
+
+class Scan:
+    """Everything the panel shows, accumulated across sources."""
+
+    def __init__(self) -> None:
+        self.models: dict[str, dict] = {}
+        self.days: dict[str, int] = {}
+        self.sessions: set[str] = set()
+        self.messages = 0
+        self.today = dt.datetime.now().strftime("%Y-%m-%d")
+        self.sources: dict[str, dict] = {}
+
+    def source(self, name: str) -> dict:
+        return self.sources.setdefault(name, {"id": name, "present": False, "messages": 0, "tokens": 0})
+
+    def add(self, client: str, model: str, day: str, tokens: dict, session: str,
+            total: Optional[int] = None) -> None:
+        counted = total if total and total > 0 else (
+            tokens["input"] + tokens["output"] + tokens["cacheRead"] + tokens["cacheWrite"])
+        if counted <= 0:
+            return
+        name = (model or "unknown").rstrip("/").split("/")[-1][:80] or "unknown"
+        key = f"{client}\0{name}"
+        bucket = self.models.get(key)
+        if bucket is None:
+            bucket = self.models[key] = {"client": client, "model": name, **token_bucket(), "total": 0}
+        bucket["input"] += tokens["input"]
+        bucket["output"] += tokens["output"]
+        bucket["cacheRead"] += tokens["cacheRead"]
+        bucket["cacheWrite"] += tokens["cacheWrite"]
+        bucket["total"] += counted
+        self.days[day] = self.days.get(day, 0) + counted
+        if session:
+            self.sessions.add(session)
+        self.messages += 1
+        entry = self.sources.get(client)
+        if entry is not None:
+            entry["present"] = True
+            entry["messages"] += 1
+            entry["tokens"] += counted
+
+    def record(self, limits: list, status: str) -> dict:
+        models = sorted(self.models.values(), key=lambda row: row["total"], reverse=True)
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "id": "opencode",
+            "name": "OpenCode",
+            "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "statusText": status,
+            "limits": limits,
+            "today": {"tokens": self.days.get(self.today, 0)},
+            "models": models[:12],
+            "totals": {
+                "tokens": sum(row["total"] for row in models),
+                "messages": self.messages,
+                "sessions": len(self.sessions),
+                "activeDays": len(self.days),
+            },
+            "sources": sorted(self.sources.values(), key=lambda entry: entry["id"]),
+        }
+
+
+# -------------------------------------------------------------------- limits
+
+def resolve_key() -> str:
+    for name in ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"):
+        candidate = (os.environ.get(name) or "").strip()
+        if candidate and len(candidate) <= MAX_KEY_LEN:
+            return candidate
+    data = read_json(xdg_data_home() / "opencode" / "auth.json")
+    if isinstance(data, dict):
+        for provider in ("opencode-go", "opencode"):
+            entry = data.get(provider)
+            if isinstance(entry, dict) and isinstance(entry.get("key"), str):
+                key = entry["key"].strip()
+                if key and len(key) <= MAX_KEY_LEN:
+                    return key
+    db = xdg_data_home() / "opencode" / "opencode.db"
+    if not db.is_file():
+        return ""
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except (OSError, sqlite3.Error):
+        return ""
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        rows = conn.execute(
+            "SELECT value FROM credential WHERE integration_id = ? AND active = 1",
+            ("opencode-go",)).fetchall()
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+    for (raw,) in rows:
+        if not isinstance(raw, str) or len(raw) > 1 << 20:
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("key"), str):
+            key = entry["key"].strip()
+            if key and len(key) <= MAX_KEY_LEN:
+                return key
+    return ""
+
+
+def parse_usage(payload: Any) -> list:
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return []
+    out = []
+    for key, title, label in WINDOWS:
+        window = usage.get(key)
+        if not isinstance(window, dict) or window.get("status") != "ok":
+            continue
+        percent = window.get("percent")
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+            continue
+        # Clamp rather than drop: a window the server reports as over 100% is
+        # still a window, and hiding it would read as "no limit".
+        percent = max(0.0, min(100.0, float(percent)))
+        resets = window.get("resetsAt")
+        out.append({
+            "label": label,
+            "title": title,
+            "percent": max(0.0, min(1.0, percent / 100.0)),
+            "resetsAt": resets if isinstance(resets, str) else "",
+        })
+    return out
+
+
+def probe_limits(key: str) -> tuple[list, str]:
+    request = urllib.request.Request(
+        USAGE_ENDPOINT, headers={"Authorization": f"Bearer {key}", "User-Agent": USER_AGENT})
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    try:
+        response = urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS)
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            return [], "Sign-in expired"
+        if error.code == 403:
+            return [], "No Go subscription"
+        return [], "Limits unavailable"
+    except (urllib.error.URLError, OSError, ValueError):
+        return [], "Limits unavailable"
+    try:
+        if response.status < 200 or response.status >= 300:
+            return [], "Limits unavailable"
+        chunks, total = [], 0
+        while True:
+            if time.monotonic() > deadline:
+                return [], "Limits unavailable"
+            chunk = response.read(min(8192, MAX_BODY_BYTES + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_BODY_BYTES:
+                return [], "Limits unavailable"
+            chunks.append(chunk)
+    except (OSError, http.client.HTTPException):
+        return [], "Limits unavailable"
+    finally:
+        response.close()
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return [], "Limits unavailable"
+    limits = parse_usage(payload)
+    return (limits, "") if limits else ([], "Limits unavailable")
+
+
+def collect_limits(force: bool) -> tuple[list, str]:
+    key = resolve_key()
+    if not key:
+        return [], "Sign in with the OpenCode CLI"
+    cache_file = cache_dir() / "limits.json"
+    cached = read_json(cache_file)
+    if isinstance(cached, dict) and not force:
+        at = cached.get("atMs")
+        if type(at) is int and (now_ms() - at) <= LIMIT_CACHE_SECONDS * 1000:
+            limits = cached.get("limits")
+            if isinstance(limits, list) and limits:
+                return limits, str(cached.get("statusText") or "")
+    limits, status = probe_limits(key)
+    if limits:
+        write_json_atomic(cache_file, {"atMs": now_ms(), "limits": limits, "statusText": status})
+        return limits, status
+    # A failed probe keeps the last known windows on screen, marked stale.
+    if isinstance(cached, dict) and isinstance(cached.get("limits"), list) and cached["limits"]:
+        return cached["limits"], status or "Limits unavailable"
+    return [], status
+
+
+# ------------------------------------------------------------------- sources
+
+def is_opencode_provider(value: Any) -> bool:
+    return isinstance(value, str) and value.lower().startswith(PROVIDER_PREFIX)
+
+
+def jsonl_sources(scan: Scan) -> None:
+    """omp/pi transcripts: one assistant message per line, usage on the message."""
+
+    roots = [Path.home() / ".pi" / "agent" / "sessions",
+             Path.home() / ".omp" / "agent" / "sessions"]
+    scan.source("omp")
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.jsonl"):
+            try:
+                handle = path.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with handle:
+                for number, line in enumerate(handle, 1):
+                    if '"usage"' not in line or '"assistant"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("type") != "message":
+                            continue
+                        message = entry.get("message")
+                        if not isinstance(message, dict) or message.get("role") != "assistant":
+                            continue
+                        provider = message.get("provider")
+                        if not is_opencode_provider(provider):
+                            continue
+                        identity = f"{path}:{entry.get('id') or number}"
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        usage = message.get("usage")
+                        if not isinstance(usage, dict):
+                            continue
+                        tokens = {
+                            "input": int_or_zero(usage.get("input")),
+                            "output": int_or_zero(usage.get("output")),
+                            "cacheRead": int_or_zero(usage.get("cacheRead")),
+                            "cacheWrite": int_or_zero(usage.get("cacheWrite")),
+                        }
+                        scan.add("omp", str(message.get("model") or ""),
+                                 day_from(entry.get("timestamp") or message.get("timestamp")),
+                                 tokens, str(path), total=int_or_zero(usage.get("totalTokens")))
+                    except (ValueError, TypeError):
+                        continue
+
+
+def _v2_tokens(entry: dict) -> dict:
+    tokens = entry.get("tokens") if isinstance(entry.get("tokens"), dict) else {}
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    output = int_or_zero(tokens.get("output")) + int_or_zero(tokens.get("reasoning"))
+    return {"input": int_or_zero(tokens.get("input")), "output": output,
+            "cacheRead": int_or_zero(cache.get("read")),
+            "cacheWrite": int_or_zero(cache.get("write"))}
+
+
+def _entry_provider(entry: dict) -> str:
+    model = entry.get("model") if isinstance(entry.get("model"), dict) else {}
+    for value in (model.get("providerID"), entry.get("providerID")):
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _entry_model(entry: dict) -> str:
+    model = entry.get("model") if isinstance(entry.get("model"), dict) else {}
+    for value in (model.get("id"), entry.get("modelID")):
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def opencode_v2(scan: Scan) -> None:
+    db = xdg_data_home() / "opencode" / "opencode.db"
+    scan.source("opencode")
+    if not db.is_file():
+        return
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+    except (OSError, sqlite3.Error):
+        return
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        rows = conn.execute(
+            "SELECT session_id, data FROM session_message WHERE type = 'assistant' LIMIT ?",
+            (MAX_ROWS,)).fetchall()
+    except sqlite3.Error:
+        return
+    finally:
+        conn.close()
+    for session_id, raw in rows:
+        if not isinstance(raw, str) or len(raw) > 1 << 20:
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or not is_opencode_provider(_entry_provider(entry)):
+            continue
+        created = entry.get("time") if isinstance(entry.get("time"), dict) else {}
+        scan.add("opencode", _entry_model(entry), day_from(created.get("created")),
+                 _v2_tokens(entry), f"opencode:{session_id}")
+
+
+def opencode_v1(scan: Scan) -> None:
+    """opencode v1 forks (crew/kirocrew) keep a flat `message` table."""
+    pattern = xdg_data_home().glob("opencode*/*.db")
+    for db in pattern:
+        if not db.is_file():
+            continue
+        scan.source("opencode-v1")
+        try:
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+        except (OSError, sqlite3.Error):
+            continue
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            rows = conn.execute("SELECT session_id, data FROM message LIMIT ?", (MAX_ROWS,)).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            conn.close()
+        for session_id, raw in rows:
+            if not isinstance(raw, str) or len(raw) > 1 << 20:
+                continue
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or not is_opencode_provider(_entry_provider(entry)):
+                continue
+            created = entry.get("time") if isinstance(entry.get("time"), dict) else {}
+            scan.add("opencode-v1", _entry_model(entry), day_from(created.get("created")),
+                     _v2_tokens(entry), f"{db.name}:{session_id}")
+
+
+def hermes_sources(scan: Scan) -> None:
+    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    scan.source("hermes")
+    candidates = [home / "state.db"]
+    profiles = home / "profiles"
+    if profiles.is_dir():
+        candidates.extend(sorted(profiles.glob("*/state.db")))
+    for db in candidates:
+        if not db.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+        except (OSError, sqlite3.Error):
+            continue
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            rows = conn.execute(
+                "SELECT id, model, billing_provider, started_at, input_tokens, output_tokens, "
+                "cache_read_tokens, cache_write_tokens, reasoning_tokens FROM sessions LIMIT ?",
+                (MAX_ROWS,)).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            conn.close()
+        for (session_id, model, provider, started, inp, out, cache_read, cache_write, reasoning) in rows:
+            if not is_opencode_provider(provider):
+                continue
+            tokens = {"input": int_or_zero(inp),
+                      "output": int_or_zero(out) + int_or_zero(reasoning),
+                      "cacheRead": int_or_zero(cache_read),
+                      "cacheWrite": int_or_zero(cache_write)}
+            scan.add("hermes", str(model or ""), day_from(started), tokens,
+                     f"hermes:{db.parent.name}:{session_id}")
+
+
+# ---------------------------------------------------------------------- main
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+    try:
+        limits, status = collect_limits(args.force)
+        scan = Scan()
+        for source in (jsonl_sources, opencode_v2, opencode_v1, hermes_sources):
+            try:
+                source(scan)
+            except Exception as error:  # noqa: BLE001 - one broken source must not blank the panel
+                print(f"opencode-usage: {source.__name__}: {type(error).__name__}: {error}",
+                      file=sys.stderr)
+        print(json.dumps(scan.record(limits, status), separators=(",", ":"), sort_keys=True))
+    except Exception as error:  # noqa: BLE001 - never leak a traceback to stdout
+        print(f"opencode-usage: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

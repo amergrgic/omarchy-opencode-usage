@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.amergrgic.opencode-usage",
+  "name": "OpenCode Go Usage",
+  "version": "1.0.0",
+  "author": "amergrgic",
+  "license": "MIT",
+  "description": "OpenCode Go allowance meters plus token usage per model across omp, opencode, and Hermes sessions.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OpenCode Go",
+    "description": "One bar icon: OpenCode Go allowance windows (Session, Weekly, Monthly) with reset countdowns, today's tokens, and a per-model share ring across omp, opencode, and Hermes sessions.",
+    "category": "AI",
+    "aliases": [
+      "opencode",
+      "opencode-go",
+      "model-usage"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSec": 60
+    },
+    "schema": [
+      {
+        "key": "refreshSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 60,
+        "description": "How often the collector rescans local session stores and refreshes the limit windows."
+      }
+    ]
+  }
+}
