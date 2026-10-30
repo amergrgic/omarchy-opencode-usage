@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "id": "io.github.amergrgic.opencode-usage",
-  "name": "OpenCode Go Usage",
-  "version": "1.0.0",
+  "name": "OpenCode Tokens, All Clients",
+  "version": "1.0.1",
   "author": "amergrgic",
   "license": "MIT",
   "description": "OpenCode Go allowance meters plus token usage per model across omp, opencode, and Hermes sessions.",
@@ -14,7 +14,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "OpenCode Go",
+    "displayName": "OpenCode Tokens",
     "description": "One bar icon: OpenCode Go allowance windows (Session, Weekly, Monthly) with reset countdowns, today's tokens, and a per-model share ring across omp, opencode, and Hermes sessions.",
     "category": "AI",
     "aliases": [

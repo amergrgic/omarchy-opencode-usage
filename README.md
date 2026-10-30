@@ -1,4 +1,4 @@
-# OpenCode Go Usage (Omarchy bar widget)
+# OpenCode Tokens, All Clients (Omarchy bar widget)
 
 ![OpenCode Go usage panel](preview.png)
 
